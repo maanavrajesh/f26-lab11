@@ -112,3 +112,38 @@ describe('the refund ledger', () => {
     expect(app.gateway.callCount()).toBe(0);
   });
 });
+
+describe('the refund ledger under redelivery', () => {
+  it('books and pays a refund once however often the message is delivered', () => {
+    const app = newApp();
+    const booking = aBookingWithRefund(app);
+    const refundMessageId = app.service.cancel(booking.id).refundMessageId!;
+
+    app.bus.redeliver(refundMessageId);
+    app.bus.redeliver(refundMessageId);
+
+    expect(app.ledger.forBooking(booking.id)).toHaveLength(1);
+    expect(app.ledger.totalRefundedCents()).toBe(8500);
+    expect(app.gateway.settledFor(booking.id)).toHaveLength(1);
+    expect(app.gateway.totalSettledCents()).toBe(8500);
+    expect(app.bus.deliveryCount(refundMessageId)).toBe(3);
+  });
+
+  it('pays on redelivery after the provider failed, without a second ledger entry', () => {
+    const app = newApp();
+    app.gateway.failOnCall(1);
+    const booking = aBookingWithRefund(app);
+    const refundMessageId = app.service.cancel(booking.id).refundMessageId!;
+
+    expect(app.ledger.forBooking(booking.id)).toHaveLength(1);
+    expect(app.gateway.totalSettledCents()).toBe(0);
+    expect(app.bus.deadLetters()).toHaveLength(1);
+
+    app.bus.redeliver(refundMessageId);
+
+    expect(app.ledger.forBooking(booking.id)).toHaveLength(1);
+    expect(app.gateway.settledFor(booking.id)).toHaveLength(1);
+    expect(app.gateway.totalSettledCents()).toBe(app.ledger.totalRefundedCents());
+    expect(app.bus.deadLetters()).toHaveLength(1);
+  });
+});

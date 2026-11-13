@@ -10,6 +10,8 @@ export interface LedgerEntry {
   amountCents: number;
   reason: string;
   recordedAtMinute: number;
+  /** The refund message this entry was written for: the idempotency key. */
+  messageId: string;
 }
 
 /**
@@ -19,11 +21,22 @@ export interface LedgerEntry {
  * payment provider for the same amount. The ledger is append only: entries are
  * numbered in the order they were written, and nothing edits or removes one
  * after the fact.
+ *
+ * The bus delivers at least once, so the same message id can arrive any number
+ * of times. The handler uses the message id as an idempotency key and guards
+ * each of its two effects separately:
+ *
+ * - the ledger entry is written only if no entry carries this message id yet;
+ * - the payment is sent only if no settlement has been recorded for this
+ *   message id yet. The id is recorded only after the provider accepted the
+ *   refund, so a delivery that failed at the provider is retried on the next
+ *   delivery instead of being skipped.
  */
 export class RefundLedger implements Subscriber<RefundRequested> {
   readonly name = 'RefundLedger';
 
   private readonly entries: LedgerEntry[] = [];
+  private readonly settledMessageIds = new Set<string>();
   private readonly gateway: PaymentGateway;
 
   constructor(gateway: PaymentGateway) {
@@ -32,15 +45,21 @@ export class RefundLedger implements Subscriber<RefundRequested> {
 
   handle(message: Message<RefundRequested>): void {
     const event = message.payload;
-    this.entries.push({
-      entryId: `led-${this.entries.length + 1}`,
-      bookingId: event.bookingId,
-      organizer: event.organizer,
-      amountCents: event.amountCents,
-      reason: event.reason,
-      recordedAtMinute: message.publishedAtMinute,
-    });
-    this.gateway.refund(event.bookingId, event.amountCents);
+    if (!this.entries.some((entry) => entry.messageId === message.id)) {
+      this.entries.push({
+        entryId: `led-${this.entries.length + 1}`,
+        bookingId: event.bookingId,
+        organizer: event.organizer,
+        amountCents: event.amountCents,
+        reason: event.reason,
+        recordedAtMinute: message.publishedAtMinute,
+        messageId: message.id,
+      });
+    }
+    if (!this.settledMessageIds.has(message.id)) {
+      this.gateway.refund(event.bookingId, event.amountCents);
+      this.settledMessageIds.add(message.id);
+    }
   }
 
   /** Every ledger entry, oldest first. */
