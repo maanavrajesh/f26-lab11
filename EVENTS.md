@@ -342,9 +342,44 @@ recorded.
 **The run.** Run `npm run demo:failure` and paste what the delivery left
 behind (the ledger, the provider, and the dead-letter list).
 
+```
+armed: call 1 to the payment provider will throw
+booked bk-1001 for 8500 cents
+cancelled bk-1001, refund 8500 cents, refund message msg-3
+the cancel call itself returned: booking is cancelled
+
+=== after the failed delivery ===
+ledger entries: 1
+  led-1 bk-1001 $85.00 (cancelled more than two hours ahead)
+gateway calls: 1
+gateway settlements: 0
+money returned in total: $0.00
+dead letters: 1
+  msg-3 refund.requested attempt 1 in RefundLedger: payment provider did not answer on call 1 for bk-1001
+    failedAtMinute: 480
+    payload: {"bookingId":"bk-1001","organizer":"H. Ahmad","organizerEmail":"hahmad@example.edu","amountCents":8500,"reason":"cancelled more than two hours ahead","requestedAtMinute":480}
+
+=== bus log ===
+  msg-1 booking.confirmed deliveries=1
+  msg-2 booking.cancelled deliveries=1
+  msg-3 refund.requested deliveries=1
+
+the refund message is in the log and in the dead-letter list. Milestone 3 asks what you do with it.
+```
+
 ### Your recovery
 
 **What, if anything, the failed delivery left undone.**
+
+The money. `RefundLedger.handle` has two effects, and the delivery got through
+only the first. It wrote `led-1 bk-1001 $85.00`, then `gateway.refund` threw on
+call 1 *before anything settled*, so the provider has **0 settlements and
+$0.00 returned**. The ledger now says $85.00 was refunded and the provider says
+nothing was: the two disagree by exactly one refund. Everything else finished.
+`cancel` returned normally (booking `cancelled`, `refundCents` 8500), because
+`publish` does not throw. The bus caught the error and recorded one dead
+letter (`msg-3`, attempt 1, `RefundLedger`). Nothing retries on its own, so
+without action the organizer is never paid.
 
 **The option you took and its evidence.** If you redelivered the
 message, paste the state after the redelivery and the bus log line for that
@@ -352,8 +387,71 @@ message. If you left the message for a person to handle, write the runbook line
 they would follow, and name which fields of the dead-lettered message they read to
 follow it and what each one tells them.
 
+**I redelivered.** At the end of `main()` in `src/demos/failureDemo.ts` I
+added `app.bus.redeliver(cancellation.refundMessageId)` (guarded against
+`undefined`, as in `replayDemo.ts`), then `printRefundState` and
+`printMessageLog` again. `npm run typecheck` stays green.
+
+```
+redelivering msg-3
+
+=== after the redelivery ===
+ledger entries: 1
+  led-1 bk-1001 $85.00 (cancelled more than two hours ahead)
+gateway calls: 2
+gateway settlements: 1
+  stl-1 bk-1001 $85.00
+money returned in total: $85.00
+dead letters: 1
+  msg-3 refund.requested attempt 1 in RefundLedger: payment provider did not answer on call 1 for bk-1001
+    failedAtMinute: 480
+    payload: {"bookingId":"bk-1001","organizer":"H. Ahmad","organizerEmail":"hahmad@example.edu","amountCents":8500,"reason":"cancelled more than two hours ahead","requestedAtMinute":480}
+
+=== bus log ===
+  msg-1 booking.confirmed deliveries=1
+  msg-2 booking.cancelled deliveries=1
+  msg-3 refund.requested deliveries=2
+```
+
+The bus log line for the refund message:
+
+```
+  msg-3 refund.requested deliveries=2
+```
+
+Delivery 2 is the recovery. On that delivery the handler found an entry
+already carrying `msg-3`, so it did **not** write `led-2`. It found no
+settlement recorded for `msg-3`, so it called the provider (gateway calls 1 →
+2), and that call settled `stl-1 $85.00`. Ledger total $85.00 = settled total
+$85.00 = what was owed. The dead-letter list still shows the attempt-1 entry,
+because the list is a log, not a queue, and `redeliver` removes nothing. It
+gained no attempt-2 entry, which is how you tell that the redelivery
+succeeded.
+
+This works only because of the milestone 2 fix. With the original handler,
+redelivery would have written `led-2` (ledger $170.00 against $85.00
+settled). With a naive fix that skipped any message already in the ledger,
+redelivery would have done nothing and the organizer would never be paid.
+The fix had to track "paid" separately from "recorded".
+
 ### The other option
 
 **What the option you did not take would have cost.** One line, in terms of who
 does the work, when the organizer gets their money, and what has to be true for
 it to be safe.
+
+Leaving it on the dead-letter list for triage puts the work on a **person**:
+they read `message.id` (`msg-3`, what to redeliver or look up),
+`subscriberName` (`RefundLedger`, which effect failed), `reason` (the provider
+did not answer, so a transient outage and not a bad amount), `attempt` (1, so
+the first try and not a repeat offender), `failedAtMinute` (480, when, to
+match against the provider's outage window), and `payload.bookingId` /
+`amountCents` (`bk-1001`, 8500, what to check at the provider). Their runbook
+line would be: *"Look up `bookingId` at the payment provider; if there is no
+settlement for it, redeliver `message.id`, otherwise mark the dead letter
+resolved."* The organizer gets their money **whenever someone gets to the
+queue**: hours, or after a weekend, instead of right away. It is safe only if
+the human actually checks the provider before acting. A person re-issuing the
+refund by hand, or redelivering against the *un*fixed handler, double-pays
+or double-books the ledger. In exchange, triage needs no idempotent handler
+and puts a human in front of a failure that might not be transient.
